@@ -23,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdint.h>
+#include <inttypes.h>
 #include <sys/stat.h>
 #include <dirent.h>
 
@@ -80,6 +82,16 @@ typedef struct {
 
     /* Optional devicetree documentation folder for driver descriptions */
     char  doc_dir[MAX_PATH];
+
+    /* Deferred forward-reference overlays (&label seen before label defined).
+     * We save the parser position and retry after the full parse pass. */
+    struct {
+        char        label[MAX_NAME];
+        const char *body_start; /* pointer into the combined source buffer */
+        const char *body_end;
+        int         file_idx;
+    } pending[512];
+    int npending;
 } Ctx;
 
 /* ═══════════════════════════════════════════════════════════
@@ -242,8 +254,14 @@ static void preprocess(Ctx *ctx, const char *path, SBuf *out, int depth)
             if (*p) p += 2;
             continue;
         }
-        /* Preprocessor directive[cite: 1] */
+        /* Preprocessor directive — only when # is the very first character
+         * on its line (immediately after \n, or at start of buffer).
+         * DTS property names like #address-cells are always indented inside
+         * a node body, so they are never at true column 0. */
         if (*p == '#') {
+            int at_col0 = (p == content || *(p - 1) == '\n');
+            if (!at_col0) { sb_appendc(out, *p++); continue; }
+
             p++;
             while (*p == ' ' || *p == '\t') p++;
             if (strncmp(p, "include", 7) == 0) {
@@ -437,6 +455,20 @@ static char *ps_read_value(Parser *ps)
 /* Forward declaration[cite: 1] */
 static void parse_body(Parser *ps, Node *node);
 
+/*
+ * Find an existing direct child of 'parent' with matching name and unit_addr.
+ * Used to merge nodes that appear across multiple files (e.g. aliases, cpus).
+ */
+static Node *find_child(Node *parent, const char *name, const char *addr)
+{
+    for (int i = 0; i < parent->nkids; i++) {
+        if (strcmp(parent->kids[i]->name, name) == 0 &&
+            strcmp(parent->kids[i]->unit_addr, addr) == 0)
+            return parent->kids[i];
+    }
+    return NULL;
+}
+
 static void parse_body(Parser *ps, Node *node)
 {
     if (!ps_eat(ps, '{')) return;
@@ -490,13 +522,28 @@ static void parse_body(Parser *ps, Node *node)
         c = ps_peekc(ps);
 
         if (c == '{') {
-            /* ── Child node ──[cite: 1] */
-            Node *child = make_node(ps->ctx, name, addr, ps->cur_file);
-            if (label[0]) {
-                strncpy(child->label, label, MAX_NAME - 1);
-                ctx_add_label(ps->ctx, label, child);
+            /* ── Child node ── merge if name@addr already exists ──[cite: 1] */
+            Node *child = find_child(node, name, addr);
+            if (child) {
+                /* Node already exists (defined in an earlier included file).
+                 * Just parse the body into it — props append in order so the
+                 * last-wins dedup at display time handles overrides correctly.
+                 * Update the label if a new one is provided. */
+                if (label[0] && !child->label[0]) {
+                    strncpy(child->label, label, MAX_NAME - 1);
+                    ctx_add_label(ps->ctx, label, child);
+                } else if (label[0]) {
+                    /* Additional alias for the same node */
+                    ctx_add_label(ps->ctx, label, child);
+                }
+            } else {
+                child = make_node(ps->ctx, name, addr, ps->cur_file);
+                if (label[0]) {
+                    strncpy(child->label, label, MAX_NAME - 1);
+                    ctx_add_label(ps->ctx, label, child);
+                }
+                node_add_kid(node, child);
             }
-            node_add_kid(node, child);
             parse_body(ps, child);
 
         } else if (c == '=') {
@@ -561,15 +608,29 @@ static void parse_toplevel(Parser *ps)
             if (ps->p < ps->end && *ps->p == '{') {
                 Node *target = ctx_find_label(ctx, label);
                 if (target) {
-                    /* Merge properties/children into the existing node[cite: 1] */
+                    /* Label already known — merge directly */
                     parse_body(ps, target);
                 } else {
-                    /* Forward reference – create a placeholder[cite: 1] */
-                    char oname[MAX_NAME + 2];
-                    snprintf(oname, sizeof(oname), "&%s", label);
-                    Node *ov = make_node(ctx, oname, NULL, ps->cur_file);
-                    if (ctx->root) node_add_kid(ctx->root, ov);
-                    parse_body(ps, ov);
+                    /* Forward reference: save position, skip the body now,
+                     * resolve in a second pass after all labels are defined. */
+                    if (ctx->npending < 512) {
+                        strncpy(ctx->pending[ctx->npending].label, label, MAX_NAME - 1);
+                        ctx->pending[ctx->npending].body_start = ps->p;
+                        ctx->pending[ctx->npending].file_idx   = ps->cur_file;
+                        ctx->npending++;
+                    }
+                    /* Skip the body without parsing */
+                    int depth = 0; ps->p++;  /* consume '{' */
+                    while (ps->p < ps->end) {
+                        char sc = *ps->p++;
+                        if (sc == '{') depth++;
+                        else if (sc == '}') {
+                            if (depth == 0) { ps_eat(ps, ';'); break; }
+                            depth--;
+                        }
+                    }
+                    /* record where the body ended (for body_end, not strictly needed) */
+                    ctx->pending[ctx->npending - 1].body_end = ps->p;
                 }
             }
             continue;
@@ -609,6 +670,11 @@ static void html_esc(FILE *f, const char *s)
     }
 }
 
+
+/* ── Forward declarations for reg decoder (defined after emit helpers) ── */
+static void get_reg_cells(Node *n, int *addr_cells, int *size_cells);
+static int  parse_reg_all_cells(const char *val, uint64_t *cells, int maxcells);
+static uint64_t cells_to_u64(const uint64_t *c, int count);
 
 /* ── JSON helpers for diagram data ── */
 
@@ -669,6 +735,15 @@ static void emit_node_json(FILE *f, Ctx *ctx, Node *n, int *first)
         }
     }
 
+    /* Deduplicated counts for diagram */
+    int dprops = 0;
+    for (Prop *pr = n->props; pr; pr = pr->next) {
+        int ov = 0;
+        for (Prop *l = pr->next; l; l = l->next)
+            if (strcmp(l->name, pr->name) == 0) { ov = 1; break; }
+        if (!ov) dprops++;
+    }
+
     if (!*first) fputs(",\n", f);
     *first = 0;
 
@@ -680,10 +755,33 @@ static void emit_node_json(FILE *f, Ctx *ctx, Node *n, int *first)
     json_str(f, n->label);
     fprintf(f, ",\"file\":%d,\"par\":%d,\"dis\":%d,\"nprops\":%d,\"nkids\":%d,\"compat\":",
             n->file_idx, n->parent ? n->parent->id : -1,
-            disabled, n->prop_count, n->nkids);
+            disabled, dprops, n->nkids);
     json_str(f, compat);
     fputs(",\"refs\":[", f);
     emit_refs_json(f, ctx, n);
+    /* Emit decoded reg regions for the memory view */
+    fputs("],\"par_name\":", f);
+    json_str(f, n->parent ? n->parent->name : "");
+    fputs(",\"reg_regions\":[", f);
+    {
+        const char *reg_val = NULL;
+        for (Prop *pr = n->props; pr; pr = pr->next)
+            if (strcmp(pr->name, "reg") == 0 && pr->value) reg_val = pr->value;
+        if (reg_val) {
+            int ac, sc;
+            get_reg_cells(n, &ac, &sc);
+            int cpr = ac + sc;
+            uint64_t cells[64];
+            int ncells = parse_reg_all_cells(reg_val, cells, 64);
+            int nreg = (cpr > 0) ? ncells / cpr : 0;
+            for (int ri = 0; ri < nreg; ri++) {
+                uint64_t addr = cells_to_u64(cells + ri * cpr,      ac);
+                uint64_t size = (sc > 0) ? cells_to_u64(cells + ri * cpr + ac, sc) : 0;
+                if (ri) fputc(',', f);
+                fprintf(f, "{\"addr\":%" PRIu64 ",\"size\":%" PRIu64 "}", addr, size);
+            }
+        }
+    }
     fputs("]}", f);
 
     for (int i = 0; i < n->nkids; i++)
@@ -1188,7 +1286,338 @@ static int lookup_driver_desc(const char *compat_val, const char *doc_dir,
     return 0;
 }
 
-/* 20 visually distinct colours for file attribution[cite: 1] */
+/* ═══════════════════════════════════════════════════════════
+ *  reg property decoder (parent #address-cells / #size-cells aware)
+ * ═════════════════════════════════════════════════════════*/
+
+/*
+ * Parse the last numeric value of a DTS property like "#address-cells = <2>;"
+ * Returns the value, or def if the property is not found / unparseable.
+ */
+static int prop_int_val(Node *n, const char *name, int def)
+{
+    const char *last = NULL;
+    for (Prop *pr = n->props; pr; pr = pr->next)
+        if (strcmp(pr->name, name) == 0 && pr->value) last = pr->value;
+    if (!last) return def;
+    /* Skip '<', whitespace, find first integer */
+    const char *p = last;
+    while (*p && (*p == '<' || *p == ' ' || *p == '\t')) p++;
+    if (!*p) return def;
+    char *end;
+    long v = strtol(p, &end, 0);
+    return (end > p) ? (int)v : def;
+}
+
+/*
+ * Get the #address-cells and #size-cells that govern the reg property of
+ * node n.  These live in n's *parent* (per the DT spec).  Walk up one level;
+ * if not found there default to 1/1 (safe for most real peripherals).
+ */
+static void get_reg_cells(Node *n, int *addr_cells, int *size_cells)
+{
+    Node *par = n->parent;
+    if (par) {
+        *addr_cells = prop_int_val(par, "#address-cells", 1);
+        *size_cells = prop_int_val(par, "#size-cells",    1);
+    } else {
+        *addr_cells = 1;
+        *size_cells = 1;
+    }
+    /* Clamp to sane range */
+    if (*addr_cells < 1 || *addr_cells > 4) *addr_cells = 1;
+    if (*size_cells < 0 || *size_cells > 4) *size_cells = 1;
+}
+
+/*
+ * Parse all cells from a DTS reg value string that may contain one or more
+ * comma-separated angle-bracket groups, e.g.:
+ *   <0x33800000 0x400000>, <0x1ff00000 0x80000>
+ *   <0x00 0x9db00000 0x00 0xc00000>
+ *
+ * If any token inside a group is non-numeric (e.g. a macro like
+ * IMX8MP_POWER_DOMAIN_VPU_VC8000E), the entire group is discarded so it
+ * cannot produce garbage cells.  Returns total cells collected (≤ maxcells).
+ */
+static int parse_reg_all_cells(const char *val, uint64_t *cells, int maxcells)
+{
+    if (!val) return 0;
+    int n = 0;
+    const char *p = val;
+    while (*p && n < maxcells) {
+        /* skip whitespace and commas between groups */
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (!*p || *p == ';') break;
+        if (*p != '<') { /* unexpected token outside brackets — stop */
+            break;
+        }
+        p++; /* consume '<' */
+
+        /* Save cell count before this group so we can roll back on error */
+        int n_before = n;
+        int group_ok = 1;
+
+        while (*p && *p != '>') {
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '>') break;
+
+            /* First char must be a digit or '-' (no macro names) */
+            if (!isdigit((unsigned char)*p) && *p != '-') {
+                /* Non-numeric token — skip to end of this group and discard */
+                while (*p && *p != '>') p++;
+                group_ok = 0;
+                break;
+            }
+
+            char *end;
+            uint64_t v = strtoull(p, &end, 0);
+            if (end == p) {
+                /* Shouldn't happen after the digit check, but be safe */
+                while (*p && *p != '>') p++;
+                group_ok = 0;
+                break;
+            }
+            if (n < maxcells) cells[n++] = v;
+            p = end;
+        }
+
+        if (*p == '>') p++; /* consume '>' */
+
+        /* Discard this group's cells if any token was non-numeric */
+        if (!group_ok) n = n_before;
+    }
+    return n;
+}
+
+/*
+ * Combine up to 4 cells into a single uint64_t (big-endian / MSB first).
+ */
+static uint64_t cells_to_u64(const uint64_t *c, int count)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < count && i < 4; i++)
+        v = (v << 32) | (c[i] & 0xFFFFFFFFULL);
+    return v;
+}
+
+/*
+ * Format a 64-bit byte size as human-readable, preferring exact units,
+ * falling back to one decimal place.
+ */
+static void fmt_size(uint64_t sz, char *out, int maxlen)
+{
+    const uint64_t GB = 1024ULL * 1024 * 1024;
+    const uint64_t MB = 1024ULL * 1024;
+    const uint64_t KB = 1024ULL;
+
+    if      (sz == 0)       snprintf(out, maxlen, "0 B");
+    else if (sz % GB == 0)  snprintf(out, maxlen, "%" PRIu64 " GB", sz / GB);
+    else if (sz >= GB)      snprintf(out, maxlen, "%.1f GB", (double)sz / GB);
+    else if (sz % MB == 0)  snprintf(out, maxlen, "%" PRIu64 " MB", sz / MB);
+    else if (sz >= MB)      snprintf(out, maxlen, "%.1f MB", (double)sz / MB);
+    else if (sz % KB == 0)  snprintf(out, maxlen, "%" PRIu64 " KB", sz / KB);
+    else if (sz >= KB)      snprintf(out, maxlen, "%.1f KB", (double)sz / KB);
+    else                    snprintf(out, maxlen, "%" PRIu64 " B", sz);
+}
+
+/*
+ * Format a single decoded region as "SIZE @ 0xADDR".
+ * For size == 0 (e.g. a register block where only the address matters) just
+ * emit "@ 0xADDR".
+ */
+static void fmt_region(uint64_t addr, uint64_t size, char *out, int maxlen)
+{
+    char szstr[32];
+    char addrstr[32];
+
+    if (addr <= 0xFFFFFFFFULL)
+        snprintf(addrstr, sizeof(addrstr), "0x%08" PRIX64, addr);
+    else
+        snprintf(addrstr, sizeof(addrstr), "0x%" PRIX64, addr);
+
+    if (size == 0) {
+        snprintf(out, maxlen, "@ %s", addrstr);
+    } else {
+        fmt_size(size, szstr, sizeof(szstr));
+        snprintf(out, maxlen, "%s @ %s", szstr, addrstr);
+    }
+}
+
+/*
+ * Build a human-readable summary of a reg property for node n.
+ * Uses the parent's #address-cells / #size-cells to parse correctly.
+ *
+ * Examples:
+ *   "12 MB @ 0x9DB00000"
+ *   "256 B @ 0xF0000120"
+ *   "2 regions: 4 KB @ 0x1000, 4 KB @ 0x2000"
+ *   "@ 0x880000000"          (size-cells = 0)
+ *
+ * Returns 1 on success, 0 if reg couldn't be decoded meaningfully.
+ */
+static int build_reg_info(Node *n, const char *reg_val, char *out, int maxlen)
+{
+    if (!reg_val || !out || maxlen < 4) return 0;
+
+    int ac, sc;
+    get_reg_cells(n, &ac, &sc);
+    int cells_per_region = ac + sc;
+    if (cells_per_region < 1) return 0;
+
+    uint64_t cells[64];
+    int ncells = parse_reg_all_cells(reg_val, cells, 64);
+    if (ncells < ac) return 0; /* not even one address worth of data */
+
+    int nregions = ncells / cells_per_region;
+    if (nregions < 1) return 0;
+
+    /* Single region — keep it terse */
+    if (nregions == 1) {
+        uint64_t addr = cells_to_u64(cells,      ac);
+        uint64_t size = (sc > 0) ? cells_to_u64(cells + ac, sc) : 0;
+        fmt_region(addr, size, out, maxlen);
+        return 1;
+    }
+
+    /* Multiple regions */
+    char tmp[64];
+    int pos = snprintf(out, maxlen, "%d regions: ", nregions);
+    for (int i = 0; i < nregions && pos < maxlen - 4; i++) {
+        uint64_t addr = cells_to_u64(cells + i * cells_per_region,      ac);
+        uint64_t size = (sc > 0)
+                        ? cells_to_u64(cells + i * cells_per_region + ac, sc) : 0;
+        fmt_region(addr, size, tmp, sizeof(tmp));
+        pos += snprintf(out + pos, maxlen - pos, "%s%s",
+                        i ? ", " : "", tmp);
+    }
+    return 1;
+}
+static const char MEMVIEW_CSS[] =
+"\n"
+"#memory-view{display:none;position:absolute;top:0;left:0;width:100%;height:100%;overflow:auto;background:var(--bg);box-sizing:border-box;}\n"
+"#mv-wrap{padding:16px 24px;min-width:600px;}\n"
+"#mv-title{font-size:11px;color:var(--fg2);text-transform:uppercase;letter-spacing:.08em;margin-bottom:14px;}\n"
+"#mv-table{width:100%;border-collapse:collapse;}\n"
+"#mv-table th{font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--fg2);padding:4px 8px;border-bottom:1px solid var(--brd);text-align:left;font-weight:600;white-space:nowrap;}\n"
+"#mv-table th.r{text-align:right;}\n"
+".mv-row{cursor:pointer;transition:background .1s;}\n"
+".mv-row:hover{background:var(--bg2);}\n"
+".mv-row td{padding:5px 8px;border-bottom:1px solid rgba(48,54,61,.5);font-size:11px;vertical-align:middle;}\n"
+".mv-bar-cell{width:30%;padding:5px 8px 5px 0 !important;}\n"
+".mv-bar-wrap{height:16px;background:var(--bg3);border-radius:3px;overflow:hidden;position:relative;min-width:30px;}\n"
+".mv-bar{height:100%;border-radius:3px;opacity:.8;transition:opacity .1s;}\n"
+".mv-row:hover .mv-bar{opacity:1;}\n"
+".mv-name{font-family:monospace;color:var(--fg);white-space:nowrap;}\n"
+".mv-lbl{color:#f97316;font-size:9.5px;margin-right:3px;}\n"
+".mv-addr{font-family:monospace;font-size:10.5px;color:#60a5fa;white-space:nowrap;}\n"
+".mv-end{font-family:monospace;font-size:10.5px;color:var(--fg2);white-space:nowrap;}\n"
+".mv-size{font-family:monospace;font-size:10.5px;color:#4ade80;white-space:nowrap;text-align:right;}\n"
+".mv-dis{opacity:.32;}\n"
+".mv-section td{padding:6px 8px 3px;font-size:9px;color:var(--fg2);text-transform:uppercase;letter-spacing:.08em;border-top:1px solid var(--brd);border-bottom:none;background:var(--bg2);}\n"
+"#mv-empty{padding:40px;color:var(--fg2);font-size:12px;text-align:center;display:none;}\n"
+"\n"
+;
+
+static const char MEMVIEW_JS[] =
+"\n"
+"var DTMemory=(function(){\n"
+"'use strict';\n"
+"var COLORS=['#4ade80','#60a5fa','#f97316','#e879f9','#facc15','#34d399','#f87171','#a78bfa','#38bdf8','#fb923c','#818cf8','#2dd4bf','#f472b6','#a3e635','#fbbf24','#c084fc','#67e8f9','#86efac','#fca5a5','#fdba74'];\n"
+"function fmt(sz){\n"
+"  if(sz===0)return'0 B';\n"
+"  var GB=1073741824,MB=1048576,KB=1024;\n"
+"  if(sz%GB===0)return(sz/GB)+' GB';\n"
+"  if(sz>=GB)return(sz/GB).toFixed(1)+' GB';\n"
+"  if(sz%MB===0)return(sz/MB)+' MB';\n"
+"  if(sz>=MB)return(sz/MB).toFixed(1)+' MB';\n"
+"  if(sz%KB===0)return(sz/KB)+' KB';\n"
+"  if(sz>=KB)return(sz/KB).toFixed(1)+' KB';\n"
+"  return sz+' B';\n"
+"}\n"
+"function hex(v){\n"
+"  if(v===0)return'0x00000000';\n"
+"  if(v<=0xFFFFFFFF)return'0x'+('00000000'+v.toString(16).toUpperCase()).slice(-8);\n"
+"  return'0x'+v.toString(16).toUpperCase();\n"
+"}\n"
+"function jumpToNode(id){\n"
+"  switchView('tree');\n"
+"  setTimeout(function(){\n"
+"    var el=document.querySelector('[data-nodeid=\"'+id+'\"]');\n"
+"    if(!el)return;\n"
+"    var p=el;\n"
+"    while(p){\n"
+"      if(p.classList&&p.classList.contains('nb')){\n"
+"        p.style.display='block';\n"
+"        var nh=p.previousElementSibling;\n"
+"        if(nh&&nh.classList.contains('nh')){\n"
+"          var a=nh.querySelector('.arr');\n"
+"          if(a)a.innerHTML='&#9660;';\n"
+"          nh.parentElement&&nh.parentElement.classList.remove('hc');\n"
+"        }\n"
+"      }\n"
+"      p=p.parentElement;\n"
+"    }\n"
+"    el.scrollIntoView({behavior:'smooth',block:'center'});\n"
+"    var nh2=el.querySelector('.nh');\n"
+"    if(nh2){nh2.classList.add('jump-hl');setTimeout(function(){nh2.classList.remove('jump-hl');},1500);}\n"
+"  },80);\n"
+"}\n"
+"function build(){\n"
+"  var regions=[];\n"
+"  DT_NODES.forEach(function(n){\n"
+"    if(!n.reg_regions||!n.reg_regions.length)return;\n"
+"    n.reg_regions.forEach(function(r,ri){\n"
+"      if(r.size===0&&r.addr===0)return;\n"
+"      var isRealAddr=r.addr>=0x10000||n.par_name==='reserved-memory';\n"
+"      if(!isRealAddr)return;\n"
+"      regions.push({id:n.id,name:n.name,addr:n.addr,lbl:n.lbl,file:n.file,dis:n.dis,parent:n.par_name||'',base:r.addr,size:r.size,ri:ri,nr:n.reg_regions.length});\n"
+"    });\n"
+"  });\n"
+"  if(!regions.length){document.getElementById('mv-empty').style.display='block';return;}\n"
+"  regions.sort(function(a,b){return a.base<b.base?-1:a.base>b.base?1:0;});\n"
+"  var maxLog=0;\n"
+"  regions.forEach(function(r){var l=Math.log2((r.size||1)+1);if(l>maxLog)maxLog=l;});\n"
+"  var tb=document.getElementById('mv-table');\n"
+"  var tbody=tb.querySelector('tbody');\n"
+"  tbody.innerHTML='';\n"
+"  var lastParent='';\n"
+"  regions.forEach(function(r){\n"
+"    var par=r.parent||'root';\n"
+"    if(par!==lastParent){\n"
+"      var sr=document.createElement('tr');sr.className='mv-section';\n"
+"      var sd=document.createElement('td');sd.colSpan=5;sd.textContent=par;\n"
+"      sr.appendChild(sd);tbody.appendChild(sr);lastParent=par;\n"
+"    }\n"
+"    var col=COLORS[r.file%COLORS.length];\n"
+"    var logW=maxLog>0?Math.max(2,Math.round((Math.log2((r.size||1)+1)/maxLog)*100)):2;\n"
+"    var tr=document.createElement('tr');\n"
+"    tr.className='mv-row'+(r.dis?' mv-dis':'');\n"
+"    tr.title='Click to jump to node';\n"
+"    tr.addEventListener('click',function(){jumpToNode(r.id);});\n"
+"    var tdB=document.createElement('td');tdB.className='mv-bar-cell';\n"
+"    var bw=document.createElement('div');bw.className='mv-bar-wrap';\n"
+"    var bar=document.createElement('div');bar.className='mv-bar';\n"
+"    bar.style.width=logW+'%';bar.style.background=col;\n"
+"    bw.appendChild(bar);tdB.appendChild(bw);\n"
+"    var tdN=document.createElement('td');\n"
+"    if(r.lbl){var ls=document.createElement('span');ls.className='mv-lbl';ls.textContent=r.lbl+':';tdN.appendChild(ls);}\n"
+"    var ns=document.createElement('span');ns.className='mv-name';\n"
+"    ns.textContent=r.name+(r.addr?'@'+r.addr:'');\n"
+"    if(r.nr>1){ns.textContent+=' ['+r.ri+']';}\n"
+"    tdN.appendChild(ns);\n"
+"    var tdA=document.createElement('td');tdA.className='mv-addr';tdA.textContent=hex(r.base);\n"
+"    var tdE=document.createElement('td');tdE.className='mv-end';tdE.textContent=r.size>0?hex(r.base+r.size-1):'--';\n"
+"    var tdS=document.createElement('td');tdS.className='mv-size';tdS.textContent=r.size>0?fmt(r.size):'--';\n"
+"    tr.appendChild(tdB);tr.appendChild(tdN);tr.appendChild(tdA);tr.appendChild(tdE);tr.appendChild(tdS);\n"
+"    tbody.appendChild(tr);\n"
+"  });\n"
+"}\n"
+"function init(){build();}\n"
+"return{init:init};\n"
+"})();\n"
+"\n"
+;
+
 static const char *COLORS[] = {
     "#4ade80","#60a5fa","#f97316","#e879f9","#facc15",
     "#34d399","#f87171","#a78bfa","#38bdf8","#fb923c",
@@ -1217,7 +1646,14 @@ static void emit_node(FILE *f, Ctx *ctx, Node *n)
         }
     }
 
-    /* ── Detect disabled status (use last 'status' prop — overlays may re-enable) ── */
+    /* ── reg property info (all nodes that have one) ── */
+    char reg_info[256] = "";
+    {
+        const char *reg_val = NULL;
+        for (Prop *pr = n->props; pr; pr = pr->next)
+            if (strcmp(pr->name, "reg") == 0 && pr->value) reg_val = pr->value;
+        if (reg_val) build_reg_info(n, reg_val, reg_info, sizeof(reg_info));
+    }
     int node_disabled = 0;
     {
         const char *last_status = NULL;
@@ -1236,10 +1672,10 @@ static void emit_node(FILE *f, Ctx *ctx, Node *n)
     }
 
     /* Outer wrapper carries search/filter data attributes[cite: 1] */
-    fprintf(f, "<div class=\"node%s%s\" data-file=\"%d\" data-name=\"",
+    fprintf(f, "<div class=\"node%s%s\" data-file=\"%d\" data-nodeid=\"%d\" data-name=\"",
             n->nkids ? " hc" : "",
             node_disabled ? " dis" : "",
-            n->file_idx);
+            n->file_idx, n->id);
     html_esc(f, n->name);
     fprintf(f, "\" data-label=\"");
     html_esc(f, n->label);
@@ -1281,8 +1717,19 @@ static void emit_node(FILE *f, Ctx *ctx, Node *n)
         fputs("</span>", f);
     }
 
-    if (n->prop_count)
-        fprintf(f, " <span class=\"pc\">%dp</span>", n->prop_count);
+    /* ── reserved-memory size+address badge removed — shown inline on reg line only ── */
+
+    /* Deduplicated prop count (last-wins, same as what we display) */
+    int dedup_props = 0;
+    for (Prop *pr = n->props; pr; pr = pr->next) {
+        int overridden = 0;
+        for (Prop *later = pr->next; later; later = later->next)
+            if (strcmp(later->name, pr->name) == 0) { overridden = 1; break; }
+        if (!overridden) dedup_props++;
+    }
+
+    if (dedup_props)
+        fprintf(f, " <span class=\"pc\">%dp</span>", dedup_props);
     if (n->nkids)
         fprintf(f, " <span class=\"kc\">%d&#8595;</span>", n->nkids);
 
@@ -1297,19 +1744,42 @@ static void emit_node(FILE *f, Ctx *ctx, Node *n)
     fprintf(f, "<div class=\"nb\">\n");
 
     if (n->prop_count) {
-        fprintf(f, "<div class=\"props\">\n");
+        /* Count and display only the *last* occurrence of each property name.
+         * Later entries override earlier ones, exactly as the kernel sees it.  */
+        int visible = 0;
         for (Prop *pr = n->props; pr; pr = pr->next) {
-            fprintf(f, "<div class=\"prop\"><span class=\"pk\">");
-            html_esc(f, pr->name);
-            fprintf(f, "</span>");
-            if (pr->value) {
-                fprintf(f, " <span class=\"eq\">=</span> <span class=\"pv\">");
-                emit_prop_value(f, pr->value); /* CHANGED: use our jump-aware emitter */
-                fprintf(f, "</span>");
-            }
-            fprintf(f, ";</div>\n");
+            int overridden = 0;
+            for (Prop *later = pr->next; later; later = later->next)
+                if (strcmp(later->name, pr->name) == 0) { overridden = 1; break; }
+            if (!overridden) visible++;
         }
-        fprintf(f, "</div>\n"); /* props[cite: 1] */
+        if (visible) {
+            fprintf(f, "<div class=\"props\">\n");
+            for (Prop *pr = n->props; pr; pr = pr->next) {
+                /* Skip if a later prop has the same name */
+                int overridden = 0;
+                for (Prop *later = pr->next; later; later = later->next)
+                    if (strcmp(later->name, pr->name) == 0) { overridden = 1; break; }
+                if (overridden) continue;
+
+                fprintf(f, "<div class=\"prop\"><span class=\"pk\">");
+                html_esc(f, pr->name);
+                fprintf(f, "</span>");
+                if (pr->value) {
+                    fprintf(f, " <span class=\"eq\">=</span> <span class=\"pv\">");
+                    emit_prop_value(f, pr->value);
+                    fprintf(f, "</span>");
+                    /* Inline decoded annotation for reg inside reserved-memory */
+                    if (strcmp(pr->name, "reg") == 0 && reg_info[0]) {
+                        fputs(" <span class=\"reg-ann\">", f);
+                        html_esc(f, reg_info);
+                        fputs("</span>", f);
+                    }
+                }
+                fprintf(f, ";</div>\n");
+            }
+            fprintf(f, "</div>\n"); /* props[cite: 1] */
+        }
     }
 
     if (n->nkids) {
@@ -1771,6 +2241,13 @@ static const char CSS[] =
 ".drv-link{color:#c084fc;opacity:0.55;font-style:normal;cursor:pointer;"
            "margin-left:3px;user-select:none;}\n"
 ".drv-link:hover{opacity:1;}\n"
+
+/* reserved-memory region size/address badge */
+".reg-badge{font-size:9.5px;color:#38bdf8;font-style:normal;margin-left:5px;"
+            "white-space:nowrap;flex-shrink:0;opacity:0.9;}\n"
+/* inline annotation on the reg property line inside expanded node */
+".reg-ann{font-size:9px;color:#38bdf8;margin-left:8px;opacity:0.75;"
+          "font-style:italic;}\n"
 
 /* Doc popup modal */
 "#doc-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;"
@@ -2437,7 +2914,7 @@ static void emit_html(Ctx *ctx, const char *main_dts_path, const char *out_path)
           "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
           "<title>DT Viz \xe2\x80\x94 ", f);
     html_esc(f, main_dts_path);
-    fprintf(f, "</title>\n<style>\n%s%s</style>\n</head>\n<body>\n", CSS, DIAGRAM_CSS);
+    fprintf(f, "</title>\n<style>\n%s%s%s</style>\n</head>\n<body>\n", CSS, DIAGRAM_CSS, MEMVIEW_CSS);
 
     /* ── Sidebar ──[cite: 1] */
     fputs("<div id=\"side\">\n", f);
@@ -2497,6 +2974,8 @@ static void emit_html(Ctx *ctx, const char *main_dts_path, const char *out_path)
           "&#x22EE; Tree</button>\n"
           "<button class=\"vbtn\" id=\"btn-diagram\" onclick=\"switchView('diagram')\">"
           "&#x2B21; Diagram</button>\n"
+          "<button class=\"vbtn\" id=\"btn-memory\" onclick=\"switchView('memory')\">"
+          "&#x25A6; Memory</button>\n"
           "</div>\n", f);
     fputs("<div id=\"main-content\">\n"
           "<div id=\"nr\">No matching nodes found.</div>\n"
@@ -2522,6 +3001,23 @@ static void emit_html(Ctx *ctx, const char *main_dts_path, const char *out_path)
           "<g id=\"diagram-g\"></g></svg>\n"
           "<div id=\"dg-hint\">Scroll to zoom Â· Drag to pan Â· Click node to expand/collapse</div>\n"
           "</div>\n", f); /* diagram-view */
+    /* ── Memory view ── */
+    fputs("<div id=\"memory-view\">\n"
+          "<div id=\"mv-wrap\">\n"
+          "<div id=\"mv-title\">Physical Address Space Map</div>\n"
+          "<div id=\"mv-empty\">No reg properties with decoded regions found.</div>\n"
+          "<table id=\"mv-table\">\n"
+          "<thead><tr>"
+          "<th style=\"width:30%\">Region</th>"
+          "<th>Node</th>"
+          "<th>Base</th>"
+          "<th>End</th>"
+          "<th class=\"r\">Size</th>"
+          "</tr></thead>\n"
+          "<tbody></tbody>\n"
+          "</table>\n"
+          "</div>\n"
+          "</div>\n", f); /* memory-view */
     fputs("</div>\n", f); /* main-content */
     fputs("</div>\n", f); /* main */
 
@@ -2545,6 +3041,7 @@ static void emit_html(Ctx *ctx, const char *main_dts_path, const char *out_path)
     }
     fputs("\n];\n", f);
     fprintf(f, "%s\n", DIAGRAM_JS);
+    fprintf(f, "%s\n", MEMVIEW_JS);
     fputs("</script>\n", f);
 
     /* ── Main JS ── */
@@ -2553,18 +3050,27 @@ static void emit_html(Ctx *ctx, const char *main_dts_path, const char *out_path)
     fputs("function switchView(v){\n"
           "  var tree=document.getElementById('tree');\n"
           "  var diag=document.getElementById('diagram-view');\n"
+          "  var mem=document.getElementById('memory-view');\n"
           "  var btnT=document.getElementById('btn-tree');\n"
           "  var btnD=document.getElementById('btn-diagram');\n"
+          "  var btnM=document.getElementById('btn-memory');\n"
+          "  tree.style.display='none';\n"
+          "  diag.style.display='none';\n"
+          "  mem.style.display='none';\n"
+          "  [btnT,btnD,btnM].forEach(function(b){if(b)b.classList.remove('vact');});\n"
           "  if(v==='tree'){\n"
-          "    tree.style.display='block'; diag.style.display='none';\n"
-          "    btnT.classList.add('vact'); btnD.classList.remove('vact');\n"
-          "  } else {\n"
-          "    tree.style.display='none'; diag.style.display='block';\n"
-          "    btnT.classList.remove('vact'); btnD.classList.add('vact');\n"
+          "    tree.style.display='block'; if(btnT)btnT.classList.add('vact');\n"
+          "  } else if(v==='diagram'){\n"
+          "    diag.style.display='block'; if(btnD)btnD.classList.add('vact');\n"
           "    if(!DTDiagram._ready){ DTDiagram.init(); DTDiagram._ready=true; }\n"
           "    else { DTDiagram.fit(); }\n"
+          "  } else if(v==='memory'){\n"
+          "    mem.style.display='block'; if(btnM)btnM.classList.add('vact');\n"
+          "    if(!DTMemory._ready){ DTMemory.init(); DTMemory._ready=true; }\n"
           "  }\n"
           "}\n"
+          "/* Init: show tree */\n"
+          "switchView('tree');\n"
           "</script>\n", f);
     fputs("</body>\n</html>\n", f);
 
@@ -2626,6 +3132,28 @@ int main(int argc, char *argv[])
     printf("[2/3] Parsing device tree ...\n");
     Parser ps = { pp.buf, pp.buf + pp.len, 0, &ctx };
     parse_toplevel(&ps);
+
+    /* 2b. Second pass: resolve forward-reference overlays (&label seen before
+     *     the label's node was defined, e.g. in a sibling include file). */
+    if (ctx.npending > 0) {
+        int resolved = 0;
+        for (int i = 0; i < ctx.npending; i++) {
+            Node *target = ctx_find_label(&ctx, ctx.pending[i].label);
+            if (target) {
+                Parser ps2 = { ctx.pending[i].body_start,
+                               pp.buf + pp.len,
+                               ctx.pending[i].file_idx,
+                               &ctx };
+                parse_body(&ps2, target);
+                resolved++;
+            } else {
+                printf("      warning: unresolved overlay &%s (label not found)\n",
+                       ctx.pending[i].label);
+            }
+        }
+        if (resolved)
+            printf("      resolved %d deferred overlay(s)\n", resolved);
+    }
 
     if (!ctx.root) {
         fprintf(stderr, "Error: no root node ('/ { }') found in %s\n", main_dts);

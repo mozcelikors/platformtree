@@ -31,6 +31,10 @@ Since the tool parses .yml based documentation files, there are false positives 
 - **Documentation Parsing**\
   Parses devicetree documentation, matches compatible property in order to bring driver information.
 
+- **Memory View**\
+  Parses allocated memory mapped IO as well as reserved regions to come up with a tentative memory map.
+
+
 ---
 
 # Visualization Output
@@ -51,6 +55,8 @@ The generated HTML provides a hierarchical view of the Device Tree.
 ![PlatformTree Search Function](pictures/search.png)
 ![PlatformTree Diagram View](pictures/diagram.png)
 ![PlatformTree Documentation Matching and Viewing](pictures/yamldisplay.png)
+![PlatformTree Memory View](pictures/memoryview.png)
+
 
 ---
 
