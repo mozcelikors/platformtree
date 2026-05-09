@@ -4,7 +4,7 @@
  * Recursively resolves #include directives, parses all DTS/DTSI nodes
  * and properties, and emits a self-contained interactive HTML tree.
  *
- * Usage:  ./platformtree <dts-folder> <main.dts> [devicetree-doc-folder]
+ * Usage:  ./platformtree <kernel-src> <main.dts>
  * Output: devicetree_viz.html
  * Build:  gcc -O2 -Wall -o platformtree platformtree.c
  *
@@ -3450,7 +3450,92 @@ static void emit_html(Ctx *ctx, const char *main_dts_path, const char *out_path)
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  Entry point[cite: 1]
+ *  DT bindings directory search
+ * ═════════════════════════════════════════════════════════*/
+
+/*
+ * Recursively search 'root' for a sub-directory whose last two path
+ * components are "devicetree/bindings".  Stops after 'depth' levels
+ * to keep runtime bounded on large kernel trees.
+ * Returns 1 and writes the full path to 'out' on success.
+ */
+static int find_bindings_recursive(const char *root, int depth, char *out)
+{
+    if (depth <= 0) return 0;
+    DIR *d = opendir(root);
+    if (!d) return 0;
+    struct dirent *e;
+    int found = 0;
+    while (!found && (e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char path[MAX_PATH];
+        snprintf(path, MAX_PATH, "%s/%s", root, e->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+
+        /* Check if this dir is named "devicetree" and contains "bindings" */
+        if (strcmp(e->d_name, "devicetree") == 0) {
+            char bpath[MAX_PATH];
+            snprintf(bpath, MAX_PATH, "%s/bindings", path);
+            if (stat(bpath, &st) == 0 && S_ISDIR(st.st_mode)) {
+                strncpy(out, bpath, MAX_PATH - 1);
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            found = find_bindings_recursive(path, depth - 1, out);
+    }
+    closedir(d);
+    return found;
+}
+
+/*
+ * Locate the DT bindings documentation directory within 'kernel_src'.
+ * Strategy (in order):
+ *   1. Canonical path: <kernel_src>/Documentation/devicetree/bindings
+ *   2. Scan each immediate sub-dir of <kernel_src>/Documentation/ for
+ *      a "devicetree/bindings" child (handles renamed doc roots).
+ *   3. Depth-limited recursive search from <kernel_src> (depth = 5).
+ * Returns 1 and writes full path to 'out' on success, 0 if not found.
+ */
+static int find_dt_bindings(const char *kernel_src, char *out)
+{
+    struct stat st;
+
+    /* 1. Canonical path */
+    snprintf(out, MAX_PATH, "%s/Documentation/devicetree/bindings", kernel_src);
+    if (stat(out, &st) == 0 && S_ISDIR(st.st_mode)) return 1;
+
+    /* 2. Walk Documentation/ sub-directories */
+    char doc_root[MAX_PATH];
+    snprintf(doc_root, MAX_PATH, "%s/Documentation", kernel_src);
+    DIR *d = opendir(doc_root);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            char candidate[MAX_PATH];
+            snprintf(candidate, MAX_PATH, "%s/%s/devicetree/bindings",
+                     doc_root, e->d_name);
+            if (stat(candidate, &st) == 0 && S_ISDIR(st.st_mode)) {
+                strncpy(out, candidate, MAX_PATH - 1);
+                closedir(d);
+                return 1;
+            }
+        }
+        closedir(d);
+    }
+
+    /* 3. Recursive scan (depth-limited to 5) */
+    if (find_bindings_recursive(kernel_src, 5, out)) return 1;
+
+    out[0] = '\0';
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  Entry point
  * ═════════════════════════════════════════════════════════*/
 
 int main(int argc, char *argv[])
@@ -3458,31 +3543,42 @@ int main(int argc, char *argv[])
     if (argc < 3) {
         fprintf(stderr,
             "Device Tree Source Visualizer\n"
-            "Usage:  %s <dts-folder> <main.dts> [dt-doc-folder] [kernel-src]\n\n"
-            "  dts-folder      directory that contains the .dts/.dtsi files\n"
-            "  main.dts        top-level device tree source file to parse\n"
-            "  dt-doc-folder   (optional) kernel DT bindings documentation folder;\n"
-            "                  when supplied, driver descriptions are shown inline\n"
-            "                  for nodes that have a 'compatible' property.\n"
-            "                  Pass \"\" to skip but still supply a kernel-src.\n"
-            "  kernel-src      (optional) kernel source root; the tool scans\n"
-            "                  drivers/, sound/, net/, fs/, ... for .compatible\n"
-            "                  strings to label each node with its responsible\n"
-            "                  driver C file and Kconfig symbol.\n\n"
+            "Usage:  %s <kernel-src> <main.dts>\n\n"
+            "  kernel-src   kernel source root directory\n"
+            "               (used for driver/Kconfig discovery and to locate\n"
+            "                the DT bindings documentation automatically)\n"
+            "  main.dts     top-level device tree source file to parse\n"
+            "               (the containing directory is used as the dts search root)\n\n"
             "Output: devicetree_viz.html (written to current directory)\n",
             argv[0]);
         return 1;
     }
 
-    const char *dts_dir    = argv[1];
+    const char *kernel_src = argv[1];
     const char *main_dts   = argv[2];
-    const char *doc_dir    = (argc >= 4 && argv[3][0]) ? argv[3] : NULL;
-    const char *kernel_src = (argc >= 5 && argv[4][0]) ? argv[4] : NULL;
+
+    /* Derive dts_dir from the directory portion of main_dts.
+     * e.g. "kernel/arch/arm64/boot/dts/freescale/imx8mp-evk.dts"
+     *   -> "kernel/arch/arm64/boot/dts/freescale"                  */
+    char dts_dir_buf[MAX_PATH];
+    {
+        strncpy(dts_dir_buf, main_dts, MAX_PATH - 1);
+        dts_dir_buf[MAX_PATH - 1] = '\0';
+        char *slash = strrchr(dts_dir_buf, '/');
+        if (slash) *slash = '\0';
+        else       strncpy(dts_dir_buf, ".", MAX_PATH - 1);
+    }
+    const char *dts_dir = dts_dir_buf;
+
+    /* Buffers for paths derived from kernel_src */
+    char doc_dir_buf[MAX_PATH];
+    doc_dir_buf[0] = '\0';
+    const char *doc_dir = NULL;
 
     Ctx ctx;
     memset(&ctx, 0, sizeof(ctx));
 
-    /* Base directory for resolving relative includes[cite: 1] */
+    /* Base directory for resolving relative includes */
     strncpy(ctx.base_dir, dts_dir, MAX_PATH - 1);
     {
         int l = (int)strlen(ctx.base_dir);
@@ -3490,23 +3586,22 @@ int main(int argc, char *argv[])
             ctx.base_dir[--l] = '\0';
     }
 
-    /* Optional kernel source root: enables driver/Kconfig discovery and
-     * also auto-derives the DT bindings doc folder if doc_dir wasn't set. */
-    if (kernel_src && kernel_src[0]) {
+    /* Kernel source root: enables driver/Kconfig discovery.
+     * The DT bindings documentation folder is searched within the kernel tree
+     * rather than being passed as an explicit argument. */
+    {
         strncpy(ctx.kernel_src, kernel_src, MAX_PATH - 1);
         int l = (int)strlen(ctx.kernel_src);
         while (l > 0 && (ctx.kernel_src[l-1]=='/' || ctx.kernel_src[l-1]=='\\'))
             ctx.kernel_src[--l] = '\0';
         printf("      kernel src   : %s\n", ctx.kernel_src);
+        printf("      dts folder   : %s\n", ctx.base_dir);
 
-        if (!doc_dir) {
-            char derived[MAX_PATH];
-            snprintf(derived, MAX_PATH, "%s/Documentation/devicetree/bindings",
-                     ctx.kernel_src);
-            struct stat st;
-            if (stat(derived, &st) == 0 && S_ISDIR(st.st_mode))
-                doc_dir = derived;
-        }
+        /* Search for the DT bindings documentation directory inside the kernel tree */
+        if (find_dt_bindings(ctx.kernel_src, doc_dir_buf) && doc_dir_buf[0])
+            doc_dir = doc_dir_buf;
+        else
+            printf("      DT doc folder: (not found in kernel tree; driver docs disabled)\n");
     }
 
     /* Optional DT binding documentation folder */

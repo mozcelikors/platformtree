@@ -32,7 +32,7 @@ Since the tool parses .yml based documentation files, there are false positives 
   Parses devicetree documentation, matches compatible property in order to bring driver information.
 
 - **Driver / Kconfig Discovery**\
-  Optionally indexes a kernel source tree (`drivers/`, `sound/`, `net/`, `fs/`, ...), scans every `.c` file for `.compatible = "..."` entries, and parses adjacent Makefiles for `obj-$(CONFIG_X) += driver.o`. Each tree node is then labelled inline with the responsible driver C file and the Kconfig symbol that enables it.
+  Indexes the kernel source tree (`drivers/`, `sound/`, `net/`, `fs/`, ...), scans every `.c` file for `.compatible = "..."` entries, and parses adjacent Makefiles for `obj-$(CONFIG_X) += driver.o`. Each tree node is then labelled inline with the responsible driver C file and the Kconfig symbol that enables it.
 
 - **Memory View**\
   Parses allocated memory mapped IO as well as reserved regions to come up with a tentative memory map.
@@ -77,40 +77,27 @@ gcc -O2 -Wall -o platformtree platformtree.c
 ## Usage
 
 ```bash
-./platformtree <dts-folder> <main.dts> [devicetree-doc-folder] [kernel-src]
+./platformtree <kernel-src> <main.dts>
 ```
 
-### Mandatory Arguments
+### Arguments
 
-`devicetree-doc-folder` is the path to the folder that contains all the relevant devicetree files that is wanted to be included in the tree. If your devicetree tree is split across multiple folders, it is highly recommended that you merge them before using the tool.
+`kernel-src` is the kernel source root directory. The tool derives everything it needs from this path automatically:
 
-`main.dts` is the main devicetree file that you want the platformtree tool to analyze.
+- The **DTS search folder** is taken from the directory containing `main.dts`, so no separate argument is needed.
+- The **DT bindings documentation folder** (`Documentation/devicetree/bindings`) is located by searching within the kernel tree. The search tries the canonical path first, then walks the `Documentation/` subtree, and finally falls back to a depth-limited recursive scan. A message is printed at startup showing the resolved path, or a warning if it could not be found.
 
-### Optional Arguments
-
-`devicetree-doc-folder`, when provided, used for fetching information regarding drivers.
-
-`kernel-src` is the kernel source root. When supplied, each node receives a `⚙ CONFIG_X · driver.c` badge derived from the kernel's own `.compatible` declarations and adjacent Makefiles. If `devicetree-doc-folder` is left as `""` and `kernel-src` is provided, the doc folder is auto-derived as `<kernel-src>/Documentation/devicetree/bindings`.
+`main.dts` is the top-level device tree source file to parse. Its containing directory is used automatically as the DTS file search root.
 
 ### Example Usage
 
 ```bash
-./platformtree kernel_imx/arch/arm64/boot/dts/freescale kernel_imx/arch/arm64/boot/dts/freescale/imx8mp-evk-mozcelikors.dts kernel_imx/Documentation/devicetree/bindings kernel_imx
+./platformtree kernel_imx kernel_imx/arch/arm64/boot/dts/freescale/imx8mp-evk-mozcelikors.dts
 ```
-
-To skip the docs folder but still wire up driver/Kconfig discovery:
-
-```bash
-./platformtree kernel/arch/arm/boot/dts/broadcom kernel/arch/arm/boot/dts/broadcom/bcm2711-rpi-4-b.dts "" kernel
-```
-
-### Input
-
-Your directory containing `.dts` and `.dtsi` files.
 
 ### Output
 
-A self-contained `devicetree_viz.html` file.
+A self-contained `devicetree_viz.html` file written to the current directory.
 
 ---
 
@@ -125,4 +112,3 @@ This tool is built specifically for embedded engineers working with complex SoC 
 > [!NOTE] Tool envisioned and constructed by mozcelikors. Coded by AI.
 
 ---
-
