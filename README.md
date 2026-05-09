@@ -31,6 +31,9 @@ Since the tool parses .yml based documentation files, there are false positives 
 - **Documentation Parsing**\
   Parses devicetree documentation, matches compatible property in order to bring driver information.
 
+- **Driver / Kconfig Discovery**\
+  Optionally indexes a kernel source tree (`drivers/`, `sound/`, `net/`, `fs/`, ...), scans every `.c` file for `.compatible = "..."` entries, and parses adjacent Makefiles for `obj-$(CONFIG_X) += driver.o`. Each tree node is then labelled inline with the responsible driver C file and the Kconfig symbol that enables it.
+
 - **Memory View**\
   Parses allocated memory mapped IO as well as reserved regions to come up with a tentative memory map.
 
@@ -56,7 +59,7 @@ The generated HTML provides a hierarchical view of the Device Tree.
 ![PlatformTree Diagram View](pictures/diagram.png)
 ![PlatformTree Documentation Matching and Viewing](pictures/yamldisplay.png)
 ![PlatformTree Memory View](pictures/memoryview.png)
-
+![alt text](pictures/drivers.png)
 
 ---
 
@@ -74,13 +77,21 @@ gcc -O2 -Wall -o platformtree platformtree.c
 ## Usage
 
 ```bash
-./platformtree <dts-folder> <main.dts> [devicetree-doc-folder]
+./platformtree <dts-folder> <main.dts> [devicetree-doc-folder] [kernel-src]
 ```
+
+`kernel-src` is the kernel source root. When supplied, each node receives a `⚙ CONFIG_X · driver.c` badge derived from the kernel's own `.compatible` declarations and adjacent Makefiles. If `devicetree-doc-folder` is left as `""` and `kernel-src` is provided, the doc folder is auto-derived as `<kernel-src>/Documentation/devicetree/bindings`.
 
 ### Example Usage
 
 ```bash
-./platformtree kernel_imx/arch/arm64/boot/dts/freescale kernel_imx/arch/arm64/boot/dts/freescale/imx8mp-evk-mozcelikors.dts kernel_imx/Documentation/devicetree/bindings
+./platformtree kernel_imx/arch/arm64/boot/dts/freescale kernel_imx/arch/arm64/boot/dts/freescale/imx8mp-evk-mozcelikors.dts kernel_imx/Documentation/devicetree/bindings kernel_imx
+```
+
+To skip the docs folder but still wire up driver/Kconfig discovery:
+
+```bash
+./platformtree kernel/arch/arm/boot/dts/broadcom kernel/arch/arm/boot/dts/broadcom/bcm2711-rpi-4-b.dts "" kernel
 ```
 
 ### Input

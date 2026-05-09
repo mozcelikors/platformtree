@@ -39,6 +39,8 @@
 #define MAX_LABELS 4096
 #define INIT_KIDS     8
 #define INIT_BUF  (512 * 1024)
+#define MAX_COMPAT  192    /* longest sane DT compatible string */
+#define MAX_KCONF    96    /* CONFIG_X symbol */
 
 /* ═══════════════════════════════════════════════════════════
  *  Data Structures[cite: 1]
@@ -63,6 +65,21 @@ typedef struct Node {
     int          id;
 } Node;
 
+/* Kernel source compatible-string lookup (driver C file + Kconfig symbol).
+ * One entry per (compat, file) sighting. A given compat may resolve to
+ * multiple drivers (e.g. fallbacks); we keep them all and show the first. */
+typedef struct {
+    char compat [MAX_COMPAT];   /* exact string from .compatible = "..."     */
+    char file   [MAX_PATH];     /* path relative to kernel src root          */
+    char kconfig[MAX_KCONF];    /* CONFIG_X symbol, "" if Makefile not found */
+} CompatEntry;
+
+/* Cached parse of one Makefile to avoid re-reading it per compat hit. */
+typedef struct {
+    char dir[MAX_PATH];
+    char *content;     /* full Makefile text, or NULL if missing */
+} MakefileCache;
+
 typedef struct {
     /* File registry[cite: 1] */
     char  fpaths[MAX_FILES][MAX_PATH];
@@ -82,6 +99,17 @@ typedef struct {
 
     /* Optional devicetree documentation folder for driver descriptions */
     char  doc_dir[MAX_PATH];
+
+    /* Optional kernel source root for driver/Kconfig lookup */
+    char  kernel_src[MAX_PATH];
+
+    /* Compat → (driver file, Kconfig) index. Filled once after parse. */
+    CompatEntry  *compats;
+    int           ncompats, cap_compats;
+
+    /* Cached parsed Makefiles, keyed by directory (relative to kernel root). */
+    MakefileCache *mks;
+    int            nmks, cap_mks;
 
     /* Deferred forward-reference overlays (&label seen before label defined).
      * We save the parser position and retry after the full parse pass. */
@@ -1287,6 +1315,287 @@ static int lookup_driver_desc(const char *compat_val, const char *doc_dir,
 }
 
 /* ═══════════════════════════════════════════════════════════
+ *  Kernel-source compatible → driver / Kconfig index
+ *
+ *  Walks the supplied kernel tree (drivers/, sound/, net/, fs/, ...) once,
+ *  scans every .c file for `.compatible = "..."` entries (the strings the
+ *  kernel binds against), and records each sighting alongside the Kconfig
+ *  symbol that gates the file (parsed from the adjacent Makefile).
+ *
+ *  The result is a flat array searched linearly during HTML emission.
+ * ═════════════════════════════════════════════════════════*/
+
+static int compat_add(Ctx *ctx, const char *compat, const char *file_rel,
+                       const char *kconfig)
+{
+    /* Skip exact (compat, file) duplicate from the same translation unit. */
+    for (int i = 0; i < ctx->ncompats; i++) {
+        if (strcmp(ctx->compats[i].compat, compat) == 0 &&
+            strcmp(ctx->compats[i].file,   file_rel) == 0)
+            return 0;
+    }
+    if (ctx->ncompats >= ctx->cap_compats) {
+        int newcap = ctx->cap_compats ? ctx->cap_compats * 2 : 1024;
+        ctx->compats = xrealloc(ctx->compats, newcap * sizeof(CompatEntry));
+        ctx->cap_compats = newcap;
+    }
+    CompatEntry *e = &ctx->compats[ctx->ncompats++];
+    strncpy(e->compat,  compat,                 MAX_COMPAT - 1);
+    strncpy(e->file,    file_rel,               MAX_PATH   - 1);
+    strncpy(e->kconfig, kconfig ? kconfig : "", MAX_KCONF  - 1);
+    e->compat [MAX_COMPAT - 1] = '\0';
+    e->file   [MAX_PATH   - 1] = '\0';
+    e->kconfig[MAX_KCONF  - 1] = '\0';
+    return 1;
+}
+
+/* Return cached Makefile contents for `dir`, loading on first request. */
+static MakefileCache *mk_get_or_load(Ctx *ctx, const char *dir)
+{
+    for (int i = 0; i < ctx->nmks; i++)
+        if (strcmp(ctx->mks[i].dir, dir) == 0) return &ctx->mks[i];
+
+    if (ctx->nmks >= ctx->cap_mks) {
+        int newcap = ctx->cap_mks ? ctx->cap_mks * 2 : 256;
+        ctx->mks = xrealloc(ctx->mks, newcap * sizeof(MakefileCache));
+        ctx->cap_mks = newcap;
+    }
+    MakefileCache *mk = &ctx->mks[ctx->nmks++];
+    strncpy(mk->dir, dir, MAX_PATH - 1);
+    mk->dir[MAX_PATH - 1] = '\0';
+
+    char path[MAX_PATH];
+    snprintf(path, MAX_PATH, "%s/Makefile", dir);
+    mk->content = read_file(path);
+    return mk;
+}
+
+/* Scan a Makefile body for `obj-$(CONFIG_X) += <basename>.o`. The first
+ * match wins. Sets out[0]='\0' if no symbol gates this basename. */
+static void parse_makefile_for_basename(const char *content, const char *basename,
+                                         char *out, int maxlen)
+{
+    out[0] = '\0';
+    if (!content || !basename || !basename[0]) return;
+    size_t blen = strlen(basename);
+
+    const char *p = content;
+    while ((p = strstr(p, "obj-")) != NULL) {
+        const char *q = p + 4;
+        char sym[MAX_KCONF];
+        sym[0] = '\0';
+
+        if (*q == '$' && *(q + 1) == '(') {
+            q += 2;
+            const char *s0 = q;
+            while (*q && *q != ')') q++;
+            if (*q != ')') { p++; continue; }
+            int slen = (int)(q - s0);
+            if (slen >= MAX_KCONF) slen = MAX_KCONF - 1;
+            memcpy(sym, s0, slen);
+            sym[slen] = '\0';
+            q++;
+        } else if (*q == 'y' || *q == 'm') {
+            strncpy(sym, "always-built", MAX_KCONF - 1);
+            sym[MAX_KCONF - 1] = '\0';
+            q++;
+        } else { p++; continue; }
+
+        while (*q == ' ' || *q == '\t') q++;
+        if      (*q == '+' && *(q + 1) == '=') q += 2;
+        else if (*q == ':' && *(q + 1) == '=') q += 2;
+        else if (*q == '=')                    q += 1;
+        else { p = q; continue; }
+
+        /* Walk the right-hand side, including line continuations. */
+        while (*q && *q != '\n') {
+            if (*q == '\\' && (*(q + 1) == '\n' || *(q + 1) == '\r')) {
+                q += 2;
+                while (*q == ' ' || *q == '\t') q++;
+                continue;
+            }
+            if (*q == ' ' || *q == '\t' || *q == '\r') { q++; continue; }
+            const char *tok = q;
+            while (*q && *q != ' ' && *q != '\t' && *q != '\n' &&
+                   *q != '\\' && *q != '\r')
+                q++;
+            int tlen = (int)(q - tok);
+            if (tlen > 2 && tok[tlen - 2] == '.' && tok[tlen - 1] == 'o') {
+                int bl2 = tlen - 2;
+                if (bl2 == (int)blen && strncmp(tok, basename, bl2) == 0) {
+                    strncpy(out, sym, maxlen - 1);
+                    out[maxlen - 1] = '\0';
+                    return;
+                }
+            }
+        }
+        if (*q == '\n') q++;
+        p = q;
+    }
+}
+
+/* Read one .c file, harvest every `.compatible = "..."` entry and
+ * record it in the index along with its Makefile-derived Kconfig sym. */
+static int kernel_scan_c_file(Ctx *ctx, const char *path)
+{
+    char *content = read_file(path);
+    if (!content) return 0;
+
+    if (!strstr(content, ".compatible")) {
+        free(content);
+        return 0;
+    }
+
+    /* Split path into <dir>/<basename>.c */
+    char dir[MAX_PATH];
+    strncpy(dir, path, MAX_PATH - 1);
+    dir[MAX_PATH - 1] = '\0';
+    char *slash = strrchr(dir, '/');
+    char basename[MAX_NAME] = "";
+    if (slash) {
+        const char *bn = slash + 1;
+        size_t nlen = strlen(bn);
+        if (nlen > 2 && bn[nlen - 2] == '.' && bn[nlen - 1] == 'c') {
+            int blen = (int)(nlen - 2);
+            if (blen >= MAX_NAME) blen = MAX_NAME - 1;
+            memcpy(basename, bn, blen);
+            basename[blen] = '\0';
+        }
+        *slash = '\0';
+    }
+    MakefileCache *mk = mk_get_or_load(ctx, dir);
+    char kconfig[MAX_KCONF];
+    parse_makefile_for_basename(mk ? mk->content : NULL, basename,
+                                 kconfig, sizeof(kconfig));
+
+    /* Trim path to be relative to the kernel src root for display. */
+    const char *file_rel = path;
+    size_t klen = strlen(ctx->kernel_src);
+    if (klen && strncmp(path, ctx->kernel_src, klen) == 0) {
+        file_rel = path + klen;
+        while (*file_rel == '/') file_rel++;
+    }
+
+    int added = 0;
+    const char *p = content;
+    while ((p = strstr(p, ".compatible")) != NULL) {
+        p += 11;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != '=') { p++; continue; }
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != '"') { continue; }
+        p++;
+        const char *cs = p;
+        while (*p && *p != '"' && *p != '\n') p++;
+        if (*p != '"') continue;
+        int clen = (int)(p - cs);
+        if (clen <= 0 || clen >= MAX_COMPAT) continue;
+        char compat[MAX_COMPAT];
+        memcpy(compat, cs, clen);
+        compat[clen] = '\0';
+        if (compat_add(ctx, compat, file_rel, kconfig)) added++;
+    }
+
+    free(content);
+    return added;
+}
+
+static void kernel_scan_dir(Ctx *ctx, const char *dir, int depth)
+{
+    if (depth > 16) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+
+    struct dirent *ent;
+    char path[MAX_PATH];
+
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+
+        snprintf(path, MAX_PATH, "%s/%s", dir, ent->d_name);
+
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            kernel_scan_dir(ctx, path, depth + 1);
+        } else {
+            size_t nlen = strlen(ent->d_name);
+            if (nlen > 2 && strcmp(ent->d_name + nlen - 2, ".c") == 0)
+                kernel_scan_c_file(ctx, path);
+        }
+    }
+    closedir(d);
+}
+
+/* Top-level: walk every directory likely to host driver source. */
+static void kernel_index_build(Ctx *ctx)
+{
+    if (!ctx->kernel_src[0]) return;
+
+    /* Driver source roots — scanning everything would re-read multi-GB of
+     * unrelated kernel code (Documentation, scripts, tools, ...). */
+    static const char *roots[] = {
+        "drivers", "sound", "net", "fs", "block", "crypto",
+        "security", "virt", "mm", "kernel", "arch"
+    };
+    int nroots = (int)(sizeof(roots) / sizeof(roots[0]));
+
+    for (int i = 0; i < nroots; i++) {
+        char path[MAX_PATH];
+        snprintf(path, MAX_PATH, "%s/%s", ctx->kernel_src, roots[i]);
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+            kernel_scan_dir(ctx, path, 0);
+    }
+}
+
+/* Search the index for a DT compatible property value, trying each
+ * comma-separated quoted entry in order. Returns 1 on hit. */
+static int find_driver_for_compat(Ctx *ctx, const char *raw_value,
+                                    char *file_out,    int file_max,
+                                    char *kconfig_out, int kconfig_max,
+                                    char *match_out,   int match_max)
+{
+    file_out[0] = '\0';
+    kconfig_out[0] = '\0';
+    if (match_out) match_out[0] = '\0';
+    if (!raw_value || !raw_value[0] || ctx->ncompats == 0) return 0;
+
+    const char *p = raw_value;
+    while (*p) {
+        while (*p && *p != '"') p++;
+        if (*p != '"') break;
+        p++;
+        const char *s0 = p;
+        while (*p && *p != '"') p++;
+        if (*p != '"') break;
+        int clen = (int)(p - s0);
+        p++;
+        if (clen <= 0 || clen >= MAX_COMPAT) continue;
+        char compat[MAX_COMPAT];
+        memcpy(compat, s0, clen);
+        compat[clen] = '\0';
+
+        for (int i = 0; i < ctx->ncompats; i++) {
+            if (strcmp(ctx->compats[i].compat, compat) == 0) {
+                strncpy(file_out,    ctx->compats[i].file,    file_max - 1);
+                strncpy(kconfig_out, ctx->compats[i].kconfig, kconfig_max - 1);
+                file_out   [file_max    - 1] = '\0';
+                kconfig_out[kconfig_max - 1] = '\0';
+                if (match_out) {
+                    strncpy(match_out, compat, match_max - 1);
+                    match_out[match_max - 1] = '\0';
+                }
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════
  *  reg property decoder (parent #address-cells / #size-cells aware)
  * ═════════════════════════════════════════════════════════*/
 
@@ -1647,6 +1956,22 @@ static void emit_node(FILE *f, Ctx *ctx, Node *n)
         }
     }
 
+    /* ── Resolve kernel driver C-file + Kconfig from kernel source ── */
+    char drv_kfile [MAX_PATH]   = "";
+    char drv_kconf [MAX_KCONF]  = "";
+    char drv_kmatch[MAX_COMPAT] = "";
+    if (ctx->kernel_src[0]) {
+        for (Prop *pr = n->props; pr; pr = pr->next) {
+            if (strcmp(pr->name, "compatible") == 0 && pr->value) {
+                find_driver_for_compat(ctx, pr->value,
+                                        drv_kfile,  sizeof(drv_kfile),
+                                        drv_kconf,  sizeof(drv_kconf),
+                                        drv_kmatch, sizeof(drv_kmatch));
+                break;
+            }
+        }
+    }
+
     /* ── reg property info (all nodes that have one) ── */
     char reg_info[256] = "";
     {
@@ -1680,7 +2005,18 @@ static void emit_node(FILE *f, Ctx *ctx, Node *n)
     html_esc(f, n->name);
     fprintf(f, "\" data-label=\"");
     html_esc(f, n->label);
-    fprintf(f, "\" data-addr=\"%s\">\n", n->unit_addr);
+    fprintf(f, "\" data-addr=\"%s\"", n->unit_addr);
+    if (drv_kconf[0]) {
+        fprintf(f, " data-kconfig=\"");
+        html_esc(f, drv_kconf);
+        fprintf(f, "\"");
+    }
+    if (drv_kfile[0]) {
+        fprintf(f, " data-drvfile=\"");
+        html_esc(f, drv_kfile);
+        fprintf(f, "\"");
+    }
+    fprintf(f, ">\n");
 
     /* ── Always-visible header ──[cite: 1] */
     fprintf(f, "<div class=\"nh\" onclick=\"tog(this)\">");
@@ -1716,6 +2052,29 @@ static void emit_node(FILE *f, Ctx *ctx, Node *n)
                 n->id);
         }
         fputs("</span>", f);
+    }
+
+    /* ── Inline kernel driver / Kconfig badge ──
+     * Shown when --kernel-src was supplied AND a driver C file declared a
+     * matching `.compatible = "..."`. Hover for the full relative path. */
+    if (drv_kfile[0]) {
+        const char *bn = strrchr(drv_kfile, '/');
+        bn = bn ? bn + 1 : drv_kfile;
+        fputs(" <span class=\"krn-badge\" title=\"", f);
+        html_esc(f, drv_kfile);
+        if (drv_kmatch[0]) {
+            fputs(" \xe2\x80\x94 matched compatible: ", f);
+            html_esc(f, drv_kmatch);
+        }
+        fputs("\">&#x2699; ", f);
+        if (drv_kconf[0]) {
+            fputs("<span class=\"krn-cfg\">", f);
+            html_esc(f, drv_kconf);
+            fputs("</span> &middot; ", f);
+        }
+        fputs("<span class=\"krn-file\">", f);
+        html_esc(f, bn);
+        fputs("</span></span>", f);
     }
 
     /* ── reserved-memory size+address badge removed — shown inline on reg line only ── */
@@ -2242,6 +2601,15 @@ static const char CSS[] =
 ".drv-link{color:#c084fc;opacity:0.55;font-style:normal;cursor:pointer;"
            "margin-left:3px;user-select:none;}\n"
 ".drv-link:hover{opacity:1;}\n"
+/* Kernel driver / Kconfig badge (shown when --kernel-src is provided) */
+".krn-badge{font-size:9.5px;font-style:italic;margin-left:6px;"
+           "flex-shrink:0;white-space:nowrap;opacity:0.92;cursor:help;"
+           "border:1px solid #1f4860;background:rgba(56,189,248,0.06);"
+           "padding:1px 6px;border-radius:3px;color:#7dd3fc;}\n"
+".krn-cfg{color:#fbbf24;font-style:normal;font-weight:600;"
+          "letter-spacing:0.02em;}\n"
+".krn-file{color:#7dd3fc;font-style:normal;}\n"
+".krn-badge:hover{opacity:1;background:rgba(56,189,248,0.12);}\n"
 
 /* reserved-memory region size/address badge */
 ".reg-badge{font-size:9.5px;color:#38bdf8;font-style:normal;margin-left:5px;"
@@ -2393,10 +2761,13 @@ static const char JS[] =
 "    var name=(el.dataset.name||'').toLowerCase();\n"
 "    var label=(el.dataset.label||'').toLowerCase();\n"
 "    var addr=(el.dataset.addr||'').toLowerCase();\n"
+"    var kcfg=(el.dataset.kconfig||'').toLowerCase();\n"
+"    var dfil=(el.dataset.drvfile||'').toLowerCase();\n"
 "    var props=el.querySelector('.props');\n"
 "    var ptxt=props?props.textContent.toLowerCase():'';\n"
 "    if(name.indexOf(q)>=0||label.indexOf(q)>=0||\n"
-"       addr.indexOf(q)>=0||ptxt.indexOf(q)>=0){\n"
+"       addr.indexOf(q)>=0||ptxt.indexOf(q)>=0||\n"
+"       kcfg.indexOf(q)>=0||dfil.indexOf(q)>=0){\n"
 "      el.classList.add('hl'); hits++;\n"
 "    } else {\n"
 "      el.classList.add('hidden');\n"
@@ -3087,20 +3458,26 @@ int main(int argc, char *argv[])
     if (argc < 3) {
         fprintf(stderr,
             "Device Tree Source Visualizer\n"
-            "Usage:  %s <dts-folder> <main.dts> [dt-doc-folder]\n\n"
+            "Usage:  %s <dts-folder> <main.dts> [dt-doc-folder] [kernel-src]\n\n"
             "  dts-folder      directory that contains the .dts/.dtsi files\n"
             "  main.dts        top-level device tree source file to parse\n"
             "  dt-doc-folder   (optional) kernel DT bindings documentation folder;\n"
             "                  when supplied, driver descriptions are shown inline\n"
-            "                  for nodes that have a 'compatible' property\n\n"
+            "                  for nodes that have a 'compatible' property.\n"
+            "                  Pass \"\" to skip but still supply a kernel-src.\n"
+            "  kernel-src      (optional) kernel source root; the tool scans\n"
+            "                  drivers/, sound/, net/, fs/, ... for .compatible\n"
+            "                  strings to label each node with its responsible\n"
+            "                  driver C file and Kconfig symbol.\n\n"
             "Output: devicetree_viz.html (written to current directory)\n",
             argv[0]);
         return 1;
     }
 
-    const char *dts_dir  = argv[1];
-    const char *main_dts = argv[2];
-    const char *doc_dir  = (argc >= 4) ? argv[3] : NULL;
+    const char *dts_dir    = argv[1];
+    const char *main_dts   = argv[2];
+    const char *doc_dir    = (argc >= 4 && argv[3][0]) ? argv[3] : NULL;
+    const char *kernel_src = (argc >= 5 && argv[4][0]) ? argv[4] : NULL;
 
     Ctx ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -3111,6 +3488,25 @@ int main(int argc, char *argv[])
         int l = (int)strlen(ctx.base_dir);
         while (l > 0 && (ctx.base_dir[l-1]=='/' || ctx.base_dir[l-1]=='\\'))
             ctx.base_dir[--l] = '\0';
+    }
+
+    /* Optional kernel source root: enables driver/Kconfig discovery and
+     * also auto-derives the DT bindings doc folder if doc_dir wasn't set. */
+    if (kernel_src && kernel_src[0]) {
+        strncpy(ctx.kernel_src, kernel_src, MAX_PATH - 1);
+        int l = (int)strlen(ctx.kernel_src);
+        while (l > 0 && (ctx.kernel_src[l-1]=='/' || ctx.kernel_src[l-1]=='\\'))
+            ctx.kernel_src[--l] = '\0';
+        printf("      kernel src   : %s\n", ctx.kernel_src);
+
+        if (!doc_dir) {
+            char derived[MAX_PATH];
+            snprintf(derived, MAX_PATH, "%s/Documentation/devicetree/bindings",
+                     ctx.kernel_src);
+            struct stat st;
+            if (stat(derived, &st) == 0 && S_ISDIR(st.st_mode))
+                doc_dir = derived;
+        }
     }
 
     /* Optional DT binding documentation folder */
@@ -3166,6 +3562,14 @@ int main(int argc, char *argv[])
     printf("      %d nodes  |  %d properties  |  %d labels\n",
            total_nodes, ctx.total_props, ctx.nlabels);
 
+    /* 2c. Build kernel driver/Kconfig index (slow, optional) */
+    if (ctx.kernel_src[0]) {
+        printf("[2c/3] Indexing kernel source for .compatible drivers ...\n");
+        kernel_index_build(&ctx);
+        printf("       %d compat sighting(s) across %d Makefile(s)\n",
+               ctx.ncompats, ctx.nmks);
+    }
+
     /* 3. Emit HTML[cite: 1] */
     const char *outfile = "devicetree_viz.html";
     printf("[3/3] Writing %s ...\n", outfile);
@@ -3173,5 +3577,8 @@ int main(int argc, char *argv[])
     printf("\nDone!  Open \033[1;32m%s\033[0m in your browser.\n", outfile);
 
     free(pp.buf);
+    free(ctx.compats);
+    for (int i = 0; i < ctx.nmks; i++) free(ctx.mks[i].content);
+    free(ctx.mks);
     return 0;
 }
