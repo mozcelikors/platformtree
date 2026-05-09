@@ -59,7 +59,7 @@ The generated HTML provides a hierarchical view of the Device Tree.
 ![PlatformTree Diagram View](pictures/diagram.png)
 ![PlatformTree Documentation Matching and Viewing](pictures/yamldisplay.png)
 ![PlatformTree Memory View](pictures/memoryview.png)
-![alt text](pictures/drivers.png)
+![PlatformTree Driver Search](pictures/drivers.png)
 
 ---
 
@@ -79,6 +79,16 @@ gcc -O2 -Wall -o platformtree platformtree.c
 ```bash
 ./platformtree <dts-folder> <main.dts> [devicetree-doc-folder] [kernel-src]
 ```
+
+### Mandatory Arguments
+
+`devicetree-doc-folder` is the path to the folder that contains all the relevant devicetree files that is wanted to be included in the tree. If your devicetree tree is split across multiple folders, it is highly recommended that you merge them before using the tool.
+
+`main.dts` is the main devicetree file that you want the platformtree tool to analyze.
+
+### Optional Arguments
+
+`devicetree-doc-folder`, when provided, used for fetching information regarding drivers.
 
 `kernel-src` is the kernel source root. When supplied, each node receives a `⚙ CONFIG_X · driver.c` badge derived from the kernel's own `.compatible` declarations and adjacent Makefiles. If `devicetree-doc-folder` is left as `""` and `kernel-src` is provided, the doc folder is auto-derived as `<kernel-src>/Documentation/devicetree/bindings`.
 

@@ -3284,7 +3284,7 @@ static void emit_html(Ctx *ctx, const char *main_dts_path, const char *out_path)
     fputs("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
           "<meta charset=\"UTF-8\">\n"
           "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
-          "<title>DT Viz \xe2\x80\x94 ", f);
+          "<title>platformtree \xe2\x80\x94 ", f);
     html_esc(f, main_dts_path);
     fprintf(f, "</title>\n<style>\n%s%s%s</style>\n</head>\n<body>\n", CSS, DIAGRAM_CSS, MEMVIEW_CSS);
 
