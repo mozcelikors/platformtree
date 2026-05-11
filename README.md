@@ -54,12 +54,28 @@ The generated HTML provides a hierarchical view of the Device Tree.
 
 # Pictures
 
+Tree View
 ![PlatformTree UI](pictures/main.png)
-![PlatformTree Search Function](pictures/search.png)
+
+Diagram View
 ![PlatformTree Diagram View](pictures/diagram.png)
-![PlatformTree Documentation Matching and Viewing](pictures/yamldisplay.png)
+
+Memory View
 ![PlatformTree Memory View](pictures/memoryview.png)
+
+Clock View
+![PlatformTree Clock View](pictures/clocks.png)
+
+Node Search
+![PlatformTree Search Function](pictures/search.png)
+
+Documentation Display
+![PlatformTree Documentation Matching and Viewing](pictures/yamldisplay.png)
+
+Driver Matching
 ![PlatformTree Driver Search](pictures/drivers.png)
+
+
 
 ---
 
